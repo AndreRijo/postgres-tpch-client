@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net"
 	"os"
 	"time"
 	"tpch_data_processor/tpch"
@@ -11,11 +12,14 @@ import (
 	"github.com/uptrace/bun"
 	"github.com/uptrace/bun/dialect/pgdialect"
 	"github.com/uptrace/bun/driver/pgdriver"
+
+	pgTpch "postgres_tpch_go_lib/src/tpch"
 )
 
 type DBInfo struct {
-	DB  *bun.DB
-	Ctx context.Context
+	DB   *bun.DB         //Direct Postgres
+	Ctx  context.Context //Direct Postgres
+	conn net.Conn        //Redirect Postgres
 }
 
 //../../../../potionDB docs/tpch_data/
@@ -23,43 +27,97 @@ type DBInfo struct {
 //go run pgClient.go --data_folder="../../../../potionDB docs/tpch_data/" --scale=0.01
 
 func Start() {
-
 	startTime := time.Now().UnixNano()
 	configs := loadConfigs()
+
+	seed := time.Now().UnixNano()
+	//queryClient.DropViews()
+	fmt.Println("[PGC]Flags loaded.")
+	var dbInfo DBInfo
+	if IS_REDIRECT {
+		dbInfo = connectToRedirect()
+	} else {
+		dbInfo = connectToPostgres()
+		dbInfo.DB.SetMaxIdleConns(200)
+	}
+	if RESET_ONLY {
+		if IS_REDIRECT {
+			SendDropTablesRedirect(dbInfo)
+		} else {
+			SendDropTables(dbInfo)
+		}
+		os.Exit(0)
+	}
+	tpchConfigs := tpch.TpchConfigs{Sf: SF, DataLoc: configs.GetConfig("folder")}
+	queryClient := CreatePGQueryClient(dbInfo, nil, tpchConfigs.Sf, seed, 0, QUERY_FUNCS_INT)
+
+	completeChan, updateDataChan := make(chan bool, 1), make(chan UpdateData, 1)
+	var tables *pgTpch.SQLTables
+	if DOES_DATALOAD {
+		fmt.Println("[PGC]Starting to load base data. Will send data to server too.")
+		tables = LoadAndSendBaseData(tpchConfigs, dbInfo, completeChan, updateDataChan)
+	} else {
+		fmt.Println("[PGC]Starting to load base data. Will NOT send data to server.")
+		tables = LoadBaseData(tpchConfigs, dbInfo, completeChan, updateDataChan)
+	}
+	queryClient.SetTables(tables)
+	<-completeChan
+	if DOES_DATALOAD || DOES_VIEWLOAD || DOES_INDEXLOAD {
+		if DOES_DATALOAD && DOES_VIEWLOAD {
+			fmt.Println("[PGC]Finished loading and uploading base data. Creating views.")
+		} else if DOES_DATALOAD && DOES_INDEXLOAD {
+			fmt.Println("[PGC]Finished loading and uploading base data. Creating indexes.")
+		} else if DOES_VIEWLOAD {
+			fmt.Println("[PGC]Finished loading base data. Creating views.")
+		} else if DOES_INDEXLOAD {
+			fmt.Println("[PGC]Finished loading base data. Creating indexes.")
+		} else {
+			fmt.Println("[PGC]Finished loading and uploading base data. Not creating views nor indexes.")
+		}
+		if DOES_VIEWLOAD {
+			queryClient.CreateViews()
+		} else if DOES_INDEXLOAD {
+			queryClient.CreateIndexes()
+		}
+		//queryClient.QueryViews()
+	} else {
+		fmt.Println("[PGC]Finished loading base data. Not creating views nor indexes.")
+	}
+	if DOES_QUERIES || DOES_UPDATES {
+		prepareQueryClientsBenchmark(*queryClient, QUERY_FUNCS_INT, startTime, updateDataChan)
+	}
+	//testQuery(dbInfo)
+
+	ignore(queryClient)
+	//select {}
+}
+
+func connectToRedirect() (dbInfo DBInfo) {
+	fmt.Printf("[PGC]Connecting to Redirect PostgresSQL on ip %s.\n", IP_DSN)
+	conn, err := net.Dial("tcp", IP_DSN)
+	if err != nil {
+		fmt.Println("[PGC]Error on connecting to Redirect PostgresSQL:", err)
+		os.Exit(1)
+	}
+	fmt.Println("[PGC]Connected to Redirect PostgresSQL.")
+
+	return DBInfo{conn: conn}
+}
+
+func connectToPostgres() (dbInfo DBInfo) {
 	ctx := context.Background()
 
-	fmt.Println("[PGC]DSN:", IP_DSN)
 	// Open a PostgreSQL database.
-	fmt.Println("[PGC]Connecting to PostgresSQL.")
-	//pgdb := sql.OpenDB(pgdriver.NewConnector(pgdriver.WithDSN(IP_DSN)))
+	fmt.Printf("[PGC]Connecting to PostgresSQL on ip %s, with user %s, on database test.\n", IP_DSN, POSTGRES_USER)
 	pgconn := pgdriver.NewConnector(pgdriver.WithNetwork("tcp"),
-		//pgdriver.WithAddr("0.0.0.0:5533"),
 		pgdriver.WithAddr(IP_DSN),
 		pgdriver.WithTLSConfig(nil),
 		pgdriver.WithUser(POSTGRES_USER),
 		pgdriver.WithDatabase("test"),
 		pgdriver.WithTimeout(180*time.Second),
-		//pgdriver.WithPassword("default"),
 	)
 	pgdb := sql.OpenDB(pgconn)
-	/*
-			pgconn := pgdriver.NewConnector(
-			pgdriver.WithNetwork("tcp"),
-			pgdriver.WithAddr("localhost:5437"),
-			pgdriver.WithTLSConfig(&tls.Config{InsecureSkipVerify: true}),
-			pgdriver.WithUser("test"),
-			pgdriver.WithPassword("test"),
-			pgdriv2r.WithDatabase("test"),
-			pgdriver.WithApplicationName("myapp"),
-			pgdriver.WithTimeout(5 * time.Second),
-			pgdriver.WithDialTimeout(5 * time.Second),
-			pgdriver.WithReadTimeout(5 * time.Second),
-			pgdriver.WithWriteTimeout(5 * time.Second),
-			pgdriver.WithConnParams(map[string]interface{}{
-				"search_path": "my_search_path",
-			}),
-		)
-	*/
+
 	fmt.Println("[PGC]Pinging PostgresSQL.")
 	err := pgdb.Ping()
 	if err != nil {
@@ -67,7 +125,6 @@ func Start() {
 		os.Exit(1)
 	}
 	fmt.Println("[PGC]Connected to PostgresSQL.")
-	fmt.Println(IP_DSN)
 
 	// Create a Bun db on top of it.
 	db := bun.NewDB(pgdb, pgdialect.New())
@@ -81,45 +138,11 @@ func Start() {
 		fmt.Println("[PGC]Successfully loaded pg_ivm extension on Postgres.")
 	}
 
-	dbInfo := DBInfo{DB: db, Ctx: ctx}
-	seed := time.Now().UnixNano()
-	//queryClient.DropViews()
-	fmt.Println("[PGC]Flags loaded.")
-	if RESET_ONLY {
-		(&SQLTables{}).SendDropTables(dbInfo)
-		os.Exit(0)
-	}
-	tpchConfigs := tpch.TpchConfigs{Sf: configs.GetFloatConfig("scale", 1.0), DataLoc: configs.GetConfig("folder")}
-	queryClient := CreatePGQueryClient(dbInfo, nil, tpchConfigs.Sf, seed, 0, QUERY_FUNCS_INT)
-
-	fmt.Println("[PGC]Starting to load base data.")
-	completeChan := make(chan bool, 1)
-	var tables *SQLTables
-	if DOES_DATALOAD {
-		tables = LoadAndSendBaseData(tpchConfigs, dbInfo, completeChan)
-	} else {
-		tables = LoadBaseData(tpchConfigs, dbInfo, completeChan)
-	}
-	queryClient.SetTables(tables)
-	<-completeChan
-	if DOES_DATALOAD {
-		fmt.Println("[PGC]Finished loading and uploading base data.")
-		queryClient.CreateViews()
-		//queryClient.QueryViews()
-	} else {
-		fmt.Println("[PGC]Finished loading base data")
-	}
-	if DOES_QUERIES {
-		prepareQueryClientsBenchmark(*queryClient, QUERY_FUNCS_INT, startTime)
-	}
-	//testQuery(dbInfo)
-
-	ignore(queryClient)
-	//select {}
+	return DBInfo{DB: db, Ctx: ctx}
 }
 
 func testQuery(dbInfo DBInfo) {
-	orderIDWanted := []Orders{{O_ORDERKEY: 2048}}
+	orderIDWanted := []pgTpch.Orders{{O_ORDERKEY: 2048}}
 	err := dbInfo.DB.NewSelect().Model(&orderIDWanted).WherePK().Scan(dbInfo.Ctx, &orderIDWanted)
 	if err != nil {
 		fmt.Println("[PGC]Error on test query on orders:", err)
